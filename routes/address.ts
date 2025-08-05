@@ -34,3 +34,29 @@ module.exports.delAddressById = function delAddressById () {
     }
   }
 }
+
+async function authenticate2(req, res){
+    const query = {
+        $where: `this.username.match(/${req.params.id}/)`
+    };
+    const query2 = {
+        $eq: `this.username.match(/${req.params.id}/)`
+    };
+
+    try {
+        let users = await User.find(query);
+        users = await User.find({
+                $and: [
+                    { orderDate: { $gte: new Date('2024-01-01') } },
+                    { status: 'completed' },
+                    { $where: `this.username.match(/${req.params.id}/)`}
+                    ]
+                }
+        );
+        users = await User.find({$where: `this.username.match(/${req.params.id}/)`});
+        users = await User.find(req.params.id);
+        users = await User.find(query2);
+    } catch (err) {
+        console.log(err);
+    }
+}
