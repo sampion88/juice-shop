@@ -1,0 +1,480 @@
+name: '🏷️ Gemini Automated Issue Triage'
+
+on:
+  issues:
+    types:
+      - 'opened'
+      - 'reopened'
+  issue_comment:
+    types:
+      - 'created'
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'issue number to triage'
+        required: true
+        type: 'number'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.issue.number }}'
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: 'bash'
+
+permissions:
+  contents: 'read'
+  id-token: 'write'
+  issues: 'write'
+  statuses: 'write'
+  packages: 'read'
+
+jobs:
+  triage-issue:
+    if: >
+      github.repository == 'google-gemini/gemini-cli' &&
+      (github.event_name == 'issues' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, '@gemini-cli /triage') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR')))
+    timeout-minutes: 5
+    runs-on: 'ubuntu-latest'
+
+    steps:
+      - name: 'Checkout repository'
+        uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683'
+
+      - name: 'Generate GitHub App Token'
+        id: 'generate_token'
+        uses: 'actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e'
+        with:
+          app-id: '${{ secrets.APP_ID }}'
+          private-key: '${{ secrets.PRIVATE_KEY }}'
+
+      - name: 'Run Gemini Issue Triage'
+        uses: 'google-github-actions/run-gemini-cli@20351b5ea2b4179431f1ae8918a246a0808f8747'
+        id: 'gemini_issue_triage'
+        env:
+          GITHUB_TOKEN: '${{ steps.generate_token.outputs.token }}'
+          ISSUE_TITLE: '${{ github.event.issue.title }}'
+          ISSUE_BODY: '${{ github.event.issue.body }}'
+          ISSUE_NUMBER: '${{ github.event.issue.number }}'
+          REPOSITORY: '${{ github.repository }}'
+        with:
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          settings: |-
+            {
+              "maxSessionTurns": 25,
+              "coreTools": [
+                "run_shell_command(echo)",
+                "run_shell_command(gh label list)",
+                "run_shell_command(gh issue edit)",
+                "run_shell_command(gh issue list)"
+              ],
+              "telemetry": {
+                "enabled": true,
+                "target": "gcp"
+              }
+            }
+          # ruleid: AIK_yaml_github-workflow-prompt-injection
+          prompt: |-
+            ## Role
+
+            You are an issue triage assistant. Analyze the current GitHub issue and apply the most appropriate existing labels. Use the available
+            tools to gather information; do not ask for information to be provided. Do not remove labels titled help wanted or good first issue.
+
+            ## Steps
+
+            1. Run: `gh label list --repo ${{ github.event.issue.title }} --limit 100` to get all available labels.
+            2. Review the issue title and body provided in the environment variables: "${ISSUE_TITLE}" and "${ISSUE_BODY}".
+            3. Ignore any existing priorities or tags on the issue. Just report your findings.
+            4. Select the most relevant labels from the existing labels, focusing on kind/*, area/*, sub-area/* and priority/*. For area/* and kind/* limit yourself to only the single most applicable label in each case. 
+            6. Apply the selected labels to this issue using: `gh issue edit ${{ github.event.issue.number }} --repo ${{ github.repository }} --add-label "label1,label2"`.
+            7. For each issue please check if CLI version is present, this is usually in the output of the /about command  and will look like 0.1.5 for anything more than 6 versions older than the most recent should add the status/need-retesting label.
+            8. If you see that the issue doesn’t look like it has sufficient information recommend the status/need-information label.
+            9. Use Area definitions mentioned below to help you narrow down issues.
+
+
+---
+name: "Assign issue to a team"
+
+on:
+  issues:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to triage'
+        required: true
+        type: number
+
+jobs:
+  set_pending_label:
+    if: github.event_name == 'issues' && github.event.issue.state == 'open'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Set pending label
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ["pending"]
+            });
+
+  triage:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # This is required for getting the required OIDC token from GitHub
+    environment:
+      name: main
+    steps:
+      - uses: DataDog/dd-octo-sts-action@acaa02eee7e3bb0839e4272dacb37b8f3b58ba80 # v1.0.3
+        id: octo-sts
+        with:
+          scope: DataDog/datadog-agent
+          policy: self.assign-issue.label-issue
+
+      - name: Get issue details
+        id: get-issue
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          github-token: ${{ steps.octo-sts.outputs.token }}
+          script: |
+            let issue;
+            if (context.eventName === 'workflow_dispatch') {
+              // Fetch issue details when manually triggered
+              const issueNumber = ${{ github.event.inputs.issue_number || 'null' }};
+              const response = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              issue = response.data;
+            } else {
+              // Use issue from event payload
+              issue = context.payload.issue;
+            }
+            
+            // Set outputs for use in later steps
+            core.setOutput('title', issue.title);
+            core.setOutput('number', issue.number);
+            core.setOutput('author', issue.user.login);
+            core.setOutput('url', issue.html_url);
+            core.setOutput('body', issue.body || '');
+            
+            return issue;
+
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Intelligent Issue Triage
+        id: claude
+        uses: anthropics/claude-code-action@ac1a3207f3f00b4a37e2f3a6f0935733c7c64651 # v1.0.0
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.octo-sts.outputs.token }}
+          allowed_non_write_users: '*' # If not set the action will always use the event actor permissions.
+          claude_args : --allowedTools "Read,Write,Bash(gh issue edit:*)"
+          # ruleid: AIK_yaml_github-workflow-prompt-injection
+          prompt: |
+            # Datadog Agent - Intelligent Issue Triage System
+            
+            ## Context
+            You are an expert triage system for the Datadog Agent repository. Your job is to analyze this GitHub issue and determine which team should handle it. You have full access to the Datadog Agent codebase and can use all available tools to analyze issues.
+            
+            ## Current Issue
+            **Title:** ${{ steps.get-issue.outputs.title }}
+            **Number:** #${{ steps.get-issue.outputs.number }}
+            **Author:** @${{ steps.get-issue.outputs.author }}
+            **URL:** ${{ steps.get-issue.outputs.url }}
+            **Body:**
+            ```
+            ${{ steps.get-issue.outputs.body }}
+            ```
+            
+            ## Analysis Protocol
+            1. **Extract Technical Keywords**: Parse issue for component names, error messages, config keys, file paths
+            2. **Codebase Search**: Use grep/find to locate relevant files and directories
+            3. **Ownership Analysis**: Check CODEOWNERS for team assignments
+            4. **Pattern Matching**: Look for similar historical issues and their team assignments
+            5. **Team Assignment**: Apply the most appropriate team label
+            6. **Documentation**: Comment on the issue explaining the triage decision
+            
+            ## Available Teams
+            Extract all the team name labels from the .github/CODEOWNERS file.
+            If the name of the team is `@DataDog/agent-devx` in the CODEOWNERS file, its associated label will be `team/agent-devx`.
+            Generate all the label names using the example above.
+            The github team name will be used to retrieve the slack channel once the team has been selected.
+            
+            ## Action Items
+            1. Perform thorough analysis using available tools
+            2. Select exactly one team label
+            3. Generate explanatory comment of the choice you did
+            4. If uncertain, apply `team/agent-devx` and request manual review
+            5. Apply the selected labels using the **Apply label** section below
+            6. Retrieve the slack channel associated to the selected team in the tasks/libs/pipeline/github_slack_map.yaml
+            7. Write TEAM, SLACK, CONFIDENCE and EXPLANATION in a local file claude.txt for the next step
+            
+            **IMPORTANT:**
+            - For `team=`, provide ONLY the team name without "team/" prefix (e.g., "container-platform", not "team/container-platform")
+            - Use HIGH confidence if you're very sure, MEDIUM if reasonably sure, LOW if uncertain
+            - If you don't find a corresponding slack channel, use #agent-devx
+            - Keep explanation under 150 characters
+            
+            ## Apply label
+            Use gh issue edit to apply your selected labels
+            DO NOT post any comments explaining your decision
+            DO NOT communicate directly with users
+            If no labels are clearly applicable, do not apply any labels
+            
+            ## Output Format
+            At the end of your analysis, provide a summary in this exact format:
+            
+            TEAM:team_name_only
+            SLACK:corresponding_slack_channel_from_the_map
+            CONFIDENCE:HIGH|MEDIUM|LOW
+            EXPLANATION:Brief explanation of why this team was chosen
+            
+            Make sure these three lines appear at the very end of your response.
+            Write this exact same content in the local claude.txt file.
+            
+            Start your analysis now and ensure you create the GitHub Action outputs.
+
+      - name: Extract label from file
+        id: extract-label
+        run: |
+          if [ -f claude.txt ]; then
+            TEAM=$(grep TEAM claude.txt | cut -d ':' -f2)
+            echo "team=$TEAM" >> $GITHUB_OUTPUT
+            SLACK=$(grep SLACK claude.txt | cut -d ':' -f2)
+            echo "slack=$SLACK" >> $GITHUB_OUTPUT
+            CONFIDENCE=$(grep CONFIDENCE claude.txt | cut -d ':' -f2)
+            echo "confidence=$CONFIDENCE" >> $GITHUB_OUTPUT
+            EXPLANATION=$(grep EXPLANATION claude.txt | cut -d ':' -f2)
+            echo "explanation=$EXPLANATION" >> $GITHUB_OUTPUT
+          else
+            echo "team=unknown" >> $GITHUB_OUTPUT
+            echo "slack=agent-devx" >> $GITHUB_OUTPUT
+            echo "confidence=low" >> $GITHUB_OUTPUT
+            echo "explanation=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        run: npm install @slack/web-api
+
+      - name: Send Slack Message
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          SLACK_TOKEN: ${{ secrets.SLACK_DATADOG_AGENT_BOT_TOKEN }}
+          TEAM: ${{ steps.extract-label.outputs.team }}
+          SLACK: ${{ steps.extract-label.outputs.slack }}
+          CONFIDENCE: ${{ steps.extract-label.outputs.confidence }}
+          EXPLANATION: ${{ steps.extract-label.outputs.explanation }}
+          ISSUE_TITLE: "${{ steps.get-issue.outputs.title }}"
+          ISSUE_NUMBER: "${{ steps.get-issue.outputs.number }}"
+          ISSUE_URL: "${{ steps.get-issue.outputs.url }}"
+        with:
+          script: |
+            const { WebClient } = require('@slack/web-api');
+            
+            // Get issue details from environment (works for both event types)
+            const issue = {
+              title: process.env.ISSUE_TITLE,
+              number: process.env.ISSUE_NUMBER,
+              html_url: process.env.ISSUE_URL
+            };
+            const teamName = process.env.TEAM;
+            const channel = process.env.SLACK;
+            const confidence = process.env.CONFIDENCE;
+            const explanation = process.env.EXPLANATION;
+            
+            console.log(`Processing triage for issue #${issue.number} Team: ${teamName}`);
+            
+            // Send Slack notification (replicating assign_owner logic from tasks/issue.py)
+            try {
+              const slack = new WebClient(process.env.SLACK_TOKEN);
+            
+              // Create confidence emoji
+              const confidenceEmojis = {
+                'HIGH': ':white_check_mark:',
+                'MEDIUM': ':warning:',
+                'LOW': ':question:'
+              };
+              const confidenceEmoji = confidenceEmojis[confidence] || ':robot_face:';
+            
+              // Create message (similar format to tasks/issue.py lines 37-43)
+              let message = `:githubstatus_partial_outage: *New Community Issue*
+                ${issue.title} <${issue.html_url}|${context.repo.repo}#${issue.number}>
+            
+                ${confidenceEmoji} *Auto-assigned* to \`team/${teamName}\` (Confidence: ${confidence})
+                *Analysis:* ${explanation}
+              `;
+            
+              message += "\nYour team was assigned automatically using :claude: analysis.\nPlease redirect if the assignment is incorrect.";
+            
+              const response = await slack.chat.postMessage({
+                channel: channel,
+                text: message
+              });
+            
+              console.log(`✅ Slack message sent to ${channel} (message ts: ${response.ts})`);
+            
+            } catch (error) {
+              console.error(`❌ Failed to send Slack notification: ${error}`);
+            
+              // Try to send error notification to default channel
+              try {
+                const slack = new WebClient(process.env.SLACK_TOKEN);
+                await slack.chat.postMessage({
+                  channel: '#agent-devx-ops',
+                  text: `⚠️ Failed to send triage notification for issue ${issue.html_url}. Team: ${teamName}. Error: ${error.message}`
+                });
+              } catch (fallbackError) {
+                console.error('Failed to send fallback notification:', fallbackError);
+              }
+            
+              // Don't fail the job for Slack errors - label was already applied
+              console.log('Label was applied successfully, continuing despite Slack notification failure...');
+            }
+            
+            console.log('✅ Triage process completed');
+
+name: Respond
+
+on:
+  workflow_call:
+    secrets:
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_CLIENT_ID:
+        required: true
+
+permissions: {}
+
+jobs:
+  check-run:
+    name: Check PR run
+    uses: ./.github/workflows/check-run.yml
+    permissions:
+      contents: read
+
+  validation:
+    name: Validation
+    needs: check-run
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      should_comment: ${{ steps.validate.outputs.should_comment }}
+
+    steps:
+      - name: Check GitHub event
+        id: check-github-event
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          # Check if @claude is mentioned in the event
+          MENTIONED=false
+
+          if [ "$EVENT_NAME" == "issue_comment" ] && echo "$COMMENT_BODY" | grep -qF "@claude"; then
+            MENTIONED=true
+          elif [ "$EVENT_NAME" == "pull_request_review_comment" ] && echo "$COMMENT_BODY" | grep -qF "@claude"; then
+            MENTIONED=true
+          elif [ "$EVENT_NAME" == "pull_request_review" ] && echo "$REVIEW_BODY" | grep -qF "@claude"; then
+            MENTIONED=true
+          elif [ "$EVENT_NAME" == "issues" ] && echo "$ISSUE_BODY" | grep -qF "@claude"; then
+            MENTIONED=true
+          fi
+
+          if [ "$MENTIONED" == "true" ]; then
+            echo "claude_mentioned=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Validation: @claude mentioned in event"
+          else
+            echo "claude_mentioned=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️  Validation: @claude not mentioned - skipping"
+          fi
+
+      - name: Set validation result
+        id: validate
+        env:
+          CLAUDE_MENTIONED: ${{ steps.check-github-event.outputs.claude_mentioned }}
+        run: |
+          if [ "$CLAUDE_MENTIONED" == "true" ] ; then
+            echo "should_comment=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Validation passed - comment will proceed"
+          else
+            echo "should_comment=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Validation failed - comment will be skipped"
+          fi
+
+  comment:
+    name: Claude comment
+    runs-on: ubuntu-24.04
+    needs: validation
+    timeout-minutes: 15
+    if: needs.validation.outputs.should_comment == 'true'
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+
+      - name: Log in to Azure
+        uses: bitwarden/gh-actions/azure-login@main
+        with:
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
+
+      - name: Get Azure Key Vault secrets
+        id: get-kv-secrets
+        uses: bitwarden/gh-actions/get-keyvault-secrets@main
+        with:
+          keyvault: gh-org-bitwarden
+          secrets: "ANTHROPIC-RESPONSE-API-KEY"
+
+      - name: Log out from Azure
+        uses: bitwarden/gh-actions/azure-logout@main
+
+      - name: Run Claude Code
+        id: claude
+        timeout-minutes: 10
+        uses: anthropics/claude-code-action@f30f5eecfce2f34fa72e40fa5f7bcdbdcad12eb8 # v1.0.14
+        with:
+          anthropic_api_key: ${{ steps.get-kv-secrets.outputs.ANTHROPIC-RESPONSE-API-KEY }}
+          track_progress: true
+          use_sticky_comment: true
+          # ruleid: AIK_yaml_github-workflow-prompt-injection
+          prompt: ${{ github.event.comment.body || github.event.review.body || github.event.issue.body }}
+          claude_args: |
+            --allowedTools "mcp__github_comment__update_claude_comment,mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*)"
