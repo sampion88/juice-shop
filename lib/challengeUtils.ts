@@ -1,5 +1,6 @@
 import { Op } from 'sequelize'
-import { ChallengeModel } from '../models/challenge'
+import { type ChallengeKey, ChallengeModel } from '../models/challenge'
+import { HintModel } from '../models/hint'
 import logger from './logger'
 import config from 'config'
 import sanitizeHtml from 'sanitize-html'
@@ -26,13 +27,15 @@ export const solveIf = function (challenge: any, criteria: () => any, isRestore:
 
 export const solve = function (challenge: any, isRestore = false) {
   challenge.solved = true
-  challenge.save().then((solvedChallenge: { difficulty: number, key: string, name: string }) => {
+  challenge.save().then(async (solvedChallenge: { difficulty: number, key: string, name: string, id: number }) => {
     logger.info(`${isRestore ? colors.grey('Restored') : colors.green('Solved')} ${solvedChallenge.difficulty}-star ${colors.cyan(solvedChallenge.key)} (${solvedChallenge.name})`)
     sendNotification(solvedChallenge, isRestore)
     if (!isRestore) {
       const cheatScore = calculateCheatScore(challenge)
+      const hintsAvailable = await HintModel.count({ where: { ChallengeId: solvedChallenge.id } })
+      const hintsUnlocked = await HintModel.count({ where: { ChallengeId: solvedChallenge.id, unlocked: true } })
       if (process.env.SOLUTIONS_WEBHOOK) {
-        webhook.notify(solvedChallenge, cheatScore).catch((error: unknown) => {
+        webhook.notify(solvedChallenge, cheatScore, hintsAvailable, hintsUnlocked).catch((error: unknown) => {
           logger.error('Webhook notification failed: ' + colors.red(utils.getErrorMessage(error)))
         })
       }
@@ -75,28 +78,24 @@ export const sendCodingChallengeNotification = function (challenge: { key: strin
 export const notSolved = (challenge: any) => challenge && !challenge.solved
 
 export const findChallengeByName = (challengeName: string) => {
-  for (const c in challenges) {
-    if (Object.prototype.hasOwnProperty.call(challenges, c)) {
-      if (challenges[c].name === challengeName) {
-        return challenges[c]
-      }
+  for (const challenge of Object.values(challenges)) {
+    if (challenge.name === challengeName) {
+      return challenge
     }
   }
   logger.warn('Missing challenge with name: ' + challengeName)
 }
 
 export const findChallengeById = (challengeId: number) => {
-  for (const c in challenges) {
-    if (Object.prototype.hasOwnProperty.call(challenges, c)) {
-      if (challenges[c].id === challengeId) {
-        return challenges[c]
-      }
+  for (const challenge of Object.values(challenges)) {
+    if (challenge.id === challengeId) {
+      return challenge
     }
   }
   logger.warn('Missing challenge with id: ' + challengeId)
 }
 
-export const solveFindIt = async function (key: string, isRestore: boolean) {
+export const solveFindIt = async function (key: ChallengeKey, isRestore: boolean = false) {
   const solvedChallenge = challenges[key]
   await ChallengeModel.update({ codingChallengeStatus: 1 }, { where: { key, codingChallengeStatus: { [Op.lt]: 2 } } })
   logger.info(`${isRestore ? colors.grey('Restored') : colors.green('Solved')} 'Find It' phase of coding challenge ${colors.cyan(solvedChallenge.key)} (${solvedChallenge.name})`)
@@ -108,7 +107,7 @@ export const solveFindIt = async function (key: string, isRestore: boolean) {
   }
 }
 
-export const solveFixIt = async function (key: string, isRestore: boolean) {
+export const solveFixIt = async function (key: ChallengeKey, isRestore: boolean = false) {
   const solvedChallenge = challenges[key]
   await ChallengeModel.update({ codingChallengeStatus: 2 }, { where: { key } })
   logger.info(`${isRestore ? colors.grey('Restored') : colors.green('Solved')} 'Fix It' phase of coding challenge ${colors.cyan(solvedChallenge.key)} (${solvedChallenge.name})`)
